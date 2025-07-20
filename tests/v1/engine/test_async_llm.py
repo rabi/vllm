@@ -399,3 +399,33 @@ async def test_check_health(monkeypatch: pytest.MonkeyPatch):
 
         # Test 3: Verify healthy engine still works after mock
         await engine.check_health()
+
+
+@pytest.mark.asyncio
+async def test_chat_method(monkeypatch: pytest.MonkeyPatch):
+    with monkeypatch.context() as m, ExitStack() as after:
+        m.setenv("VLLM_USE_V1", "1")
+
+        with set_default_torch_num_threads(1):
+            engine = AsyncLLM.from_engine_args(TEXT_ENGINE_ARGS)
+        after.callback(engine.shutdown)
+
+        messages = [
+            {
+                "role": "user",
+                "content": "What is the capital of France?"
+            },
+        ]
+
+        sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
+        request_id = "chat-0"
+        results_generator = await engine.chat(messages=messages,
+                                            sampling_params=sampling_params,
+                                            request_id=request_id)
+
+        final_output = None
+        async for request_output in results_generator:
+            final_output = request_output
+
+        assert final_output is not None
+        assert "Paris" in final_output.outputs[0].text

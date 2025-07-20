@@ -12,6 +12,10 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.chat_utils import (apply_hf_chat_template,
+                                         apply_mistral_chat_template,
+                                         parse_chat_messages,
+                                         resolve_chat_template_content_format)
 from vllm.envs import VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
 from vllm.inputs import PromptType
 from vllm.inputs.preprocess import InputPreprocessor
@@ -24,7 +28,7 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value)
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizer_group import init_tokenizer_from_configs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Device, cdiv
@@ -107,7 +111,8 @@ class AsyncLLM(EngineClient):
         self.tokenizer = init_tokenizer_from_configs(
             model_config=vllm_config.model_config,
             scheduler_config=vllm_config.scheduler_config,
-            lora_config=vllm_config.lora_config)
+            lora_config=vllm_config.lora_config,
+        )
 
         # Processor (converts Inputs --> EngineCoreRequests).
         self.processor = Processor(
@@ -236,9 +241,17 @@ class AsyncLLM(EngineClient):
 
         # Convert Input --> Request.
         prompt_str, request = self.processor.process_inputs(
-            request_id, prompt, params, arrival_time, lora_request,
-            tokenization_kwargs, trace_headers, prompt_adapter_request,
-            priority, data_parallel_rank)
+            request_id,
+            prompt,
+            params,
+            arrival_time,
+            lora_request,
+            tokenization_kwargs,
+            trace_headers,
+            prompt_adapter_request,
+            priority,
+            data_parallel_rank,
+        )
 
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_str, None, 0, queue)
@@ -255,11 +268,14 @@ class AsyncLLM(EngineClient):
                                     idx, queue)
         return queue
 
-    async def _add_request(self, request: EngineCoreRequest,
-                           prompt: Optional[str],
-                           parent_req: Optional[ParentRequest], index: int,
-                           queue: RequestOutputCollector):
-
+    async def _add_request(
+        self,
+        request: EngineCoreRequest,
+        prompt: Optional[str],
+        parent_req: Optional[ParentRequest],
+        index: int,
+        queue: RequestOutputCollector,
+    ):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index,
                                           queue)
@@ -359,6 +375,80 @@ class AsyncLLM(EngineClient):
                 logger.info("Request %s failed.", request_id)
             raise EngineGenerateError() from e
 
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        sampling_params: SamplingParams,
+        request_id: str,
+        lora_request: Optional[LoRARequest] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        priority: int = 0,
+        data_parallel_rank: Optional[int] = None,
+        chat_template: Optional[str] = None,
+        add_generation_prompt: bool = True,
+        tools: Optional[list[dict[str, Any]]] = None,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        tokenizer = await self.get_tokenizer(lora_request)
+        model_config = await self.get_model_config()
+        resolved_content_format = resolve_chat_template_content_format(
+            chat_template,
+            tools,
+            "auto",
+            tokenizer,
+            model_config=model_config,
+        )
+
+        conversation, mm_data = parse_chat_messages(
+            messages,
+            model_config,
+            tokenizer,
+            content_format=resolved_content_format,
+        )
+
+        _chat_template_kwargs: dict[str, Any] = dict(
+            chat_template=chat_template,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+        )
+        _chat_template_kwargs.update(chat_template_kwargs or {})
+
+        if isinstance(tokenizer, MistralTokenizer):
+            prompt_token_ids = apply_mistral_chat_template(
+                tokenizer,
+                messages=messages,
+                **_chat_template_kwargs,
+            )
+        else:
+            prompt_str = apply_hf_chat_template(
+                tokenizer=tokenizer,
+                conversation=conversation,
+                model_config=model_config,
+                **_chat_template_kwargs,
+            )
+            # Special tokens are already included in chat templates so
+            # should not be added by the tokenizer in this case.
+            prompt_token_ids = tokenizer.encode(prompt_str,
+                                                add_special_tokens=False)
+
+        prompt = {"prompt_token_ids": prompt_token_ids}
+
+        if mm_data is not None:
+            prompt["multi_modal_data"] = mm_data
+
+        async for output in self.generate(
+                prompt,
+                sampling_params,
+                request_id,
+                lora_request,
+                trace_headers,
+                prompt_adapter_request,
+                priority,
+                data_parallel_rank,
+        ):
+            yield output
+
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
 
@@ -379,8 +469,8 @@ class AsyncLLM(EngineClient):
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
 
-                    iteration_stats = IterationStats() if (
-                        log_stats and num_outputs) else None
+                    iteration_stats = (IterationStats() if
+                                       (log_stats and num_outputs) else None)
 
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
@@ -390,7 +480,8 @@ class AsyncLLM(EngineClient):
                     else:
                         slices = np.array_split(
                             outputs.outputs,
-                            cdiv(num_outputs, VLLM_V1_OUTPUT_PROC_CHUNK_SIZE))
+                            cdiv(num_outputs, VLLM_V1_OUTPUT_PROC_CHUNK_SIZE),
+                        )
 
                     for i, outputs_slice in enumerate(slices):
                         # 2) Process EngineCoreOutputs.
@@ -598,11 +689,13 @@ class AsyncLLM(EngineClient):
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
 
-    async def collective_rpc(self,
-                             method: str,
-                             timeout: Optional[float] = None,
-                             args: tuple = (),
-                             kwargs: Optional[dict] = None):
+    async def collective_rpc(
+            self,
+            method: str,
+            timeout: Optional[float] = None,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+    ):
         """
         Perform a collective RPC call to the given path.
         """
@@ -635,22 +728,26 @@ class AsyncLLM(EngineClient):
             drain_timeout:
                 Maximum time to wait for requests to drain (seconds)
         """
-        old_data_parallel_size = \
-            self.vllm_config.parallel_config.data_parallel_size
+        old_data_parallel_size = (
+            self.vllm_config.parallel_config.data_parallel_size)
         if old_data_parallel_size == new_data_parallel_size:
-            logger.info("Data parallel size is already %s, skipping scale",
-                        new_data_parallel_size)
+            logger.info(
+                "Data parallel size is already %s, skipping scale",
+                new_data_parallel_size,
+            )
             return
         logger.info(
-            "Waiting for requests to drain before "
-            "scaling up to %s engines...", new_data_parallel_size)
+            "Waiting for requests to drain before scaling up to %s engines...",
+            new_data_parallel_size,
+        )
         await self.wait_for_requests_to_drain(drain_timeout)
         logger.info(
-            "Requests have been drained, proceeding with scale "
-            "to %s engines", new_data_parallel_size)
+            "Requests have been drained, proceeding with scale to %s engines",
+            new_data_parallel_size,
+        )
         await self.engine_core.scale_elastic_ep(new_data_parallel_size)
-        self.vllm_config.parallel_config.data_parallel_size = \
-            new_data_parallel_size
+        self.vllm_config.parallel_config.data_parallel_size = (
+            new_data_parallel_size)
 
         # recreate stat loggers
         if new_data_parallel_size > old_data_parallel_size:
